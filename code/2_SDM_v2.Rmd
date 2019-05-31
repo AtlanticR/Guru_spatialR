@@ -1,0 +1,420 @@
+---
+title: "Spatial Analysis in Maritimes Region"
+author: "Code contributors to-date: B. Hubley, J. Choi, A. Cook, M.E. Greenlaw, K. French, P. Greyson, C. Gomez"
+date: "May 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+rm(list=ls())
+knitr::opts_chunk$set(echo = TRUE)
+```
+This document consolidates a range of methodological approaches to conduct spatial analysis and modeling in the Scotian Shelf Bioregion. Spatial modeling of the same area using different methods may provide dissimilar results, therefore, standards and protocols must be developed to explicitly state the methods and metadata associated with their production <https://www.frontiersin.org/articles/10.3389/fmars.2017.00288/full?utm_source=F-AAE&utm_medium=EMLF&utm_campaign=MRK_398354_45_Marine_20170921_arts_A>. In this context, we explored how dissimilar are predictions using the same data and different algorithms (i.e. Bioclim, GAM, Maxent, and Random Forest). 
+
+! [Workflow] (..documents/sdm_workflow.png)
+
+Our ultimate goal of this and future collaborations is to share best practices, document efforts being conducted in Maritimes region at DFO, and facilitate transparency and reproducibility of analysis. 
+
+### Step 1: Install and/or load libraries  
+
+Make sure you install all packages required for this step (see 1_Setup.R)
+
+```{r echo = TRUE, warning=FALSE, message=FALSE}
+library(devtools)
+library(dismo)
+library(fields)
+library(lattice)
+library(lubridate)
+library(Matrix)
+library(mgcv)
+library(RandomFields)
+library(randomForest)
+library(raster)
+library(RColorBrewer)
+library(rJava)
+library(rgdal)
+library(ROCR)
+library(rgdal)
+library(sp)
+library(spatstat)
+library(SpatialHub)
+library(spacetime)
+library(oce)
+library(ocedata)
+pal <- colorRampPalette(rev(brewer.pal(11, "Spectral")))(100)
+grid <- 3000
+```
+
+### Step 2: Response Variable - Mystery species data 
+
+For this exercise, we are using species sampled in the summer Research Vessel (RV) survey in Maritimes Region. 
+
+Navigate to the _Guru-SpatialR_ folder and create a new folder labeled _data_. This will be the folder where the data inputs should be stored. Dowload the species data for this exercise here <https://www.dropbox.com/s/xf8idhcw5251alc/Sim1.rdata?dl=0> and save it in the _data_ folder. 
+
+The following lines of code will load the species data _Sim1.rdata_, and will transform latitude and longitude to UTM coordinates reported in km (plat and plon). This transformation is necessary so the species data matches the same projection as the environmental data.  
+
+```{r}
+load("../data/Sim1.rdata")
+simData <- lonlat2planar(simData,"utm20", input_names=c("X", "Y"))
+head(simData)
+```
+plot SimData using 
+
+```{r}
+simData_pres <- subset(simData, P.A == 1)
+with(simData, plot(X, Y, col='lightgrey', pch=19, xlab="Longitude", ylab="Latitude"))
+with(simData_pres, points(X,Y, pch=19, cex=0.6))
+data("coastlineWorldFine") # from the ocedata package
+lines(coastlineWorldFine[['longitude']], coastlineWorldFine[['latitude']]) #access object in the double wrackets
+```
+
+
+### Step 3: Predictor variables - Environmental data 
+
+Bathymetry and bottom temperature assembled for this work in the Scotian Shelf bioregion were originally derived and assembled as part of the Snowcrab assessment in DFO's Maritimes Region (Hubley et al. 2018) <http://publications.gc.ca/collections/collection_2018/mpo-dfo/fs70-5/Fs70-5-2017-053-eng.pdf> 
+
+Environmental predictors and species data used in this project are projected in (planar) UTM coordinates reported in km. 
+
+Download environmental data <https://www.dropbox.com/s/lm5ugii6607lveb/Env1.rdata?dl=0> and save it in the sub-folder _data_  
+
+Following code loads ocean depth (z) and bottom temperature interpolations (tmean.climatology) 
+
+```{r}
+load("../data/Env1.rdata")
+head(predSpace)
+```
+#### Ocean depth
+
+Note all maps presented in this documents are plotted using the function planarMap <https://github.com/BradHubley/SpatialHub/blob/master/R/planarMap.r> 
+
+```{r}
+	xyz = predSpace[c('plon','plat','z')]
+	datascale = seq(10,600,l=50)
+	corners = data.frame(lon=c(-67.54,-56.5),lat=c(41,47.2))
+
+	planarMap( xyz, fn="Depth", loc="output", datascale=datascale , corners=corners,log.variable=T,rev=T)
+```
+
+#### Bottom temperature
+
+Interpolations derived from the summer Ecosystem Research Vessel (RV) survey 
+
+```{r}
+	xyz = predSpace[c('plon','plat','tmean.climatology')]
+	datarange = quantile(xyz[,3],probs=c(0.01,0.99),na.rm=T)
+	datascale = seq(datarange[1],datarange[2],l=50)
+	corners = data.frame(lon=c(-67.54,-56.5),lat=c(41,47.2))
+
+	planarMap( xyz, fn="tmean.climatology", loc="output", datascale=datascale , corners=corners,save=F)
+```
+
+### 	Step 4: Spatial Modelling
+
+The following code and workflow build Species Distribution Models (SDM) using the environmental and species data loaded in step 1 and 2, including:
+
+- Bioclim: presence-only model
+
+- general additive models (GAMs): presence-absence models
+
+- Maximum Entropy (Maxent): presence-only models
+
+- Random forest: presence-absence models
+
+- Boosted Regression Trees: presence-absence models (under-development)
+
+- Bayesian with INLA: presence-absence models (under-development)
+
+
+#### Bioclim
+
+R-package dismo: <https://cran.r-project.org/web/packages/dismo/dismo.pdf>
+
+The Bioclim algorithm has been extensively used for species distribution modeling, knows as the classic ’climate-envelope-model’. Note that Bioclim does not perform as good as some other modeling methods (Elith et al. 2006) and is unsuited for predicting climate change effects (Hijmans  and Graham, 2006). 
+
+The BIOCLIM algorithm computes the similarity of a location by comparing the values of environmental variables at any location to a percentile distribution of the values at known locations of occurrence (’training sites’). The closer to the 50th percentile (the median), the more suitable the location is. The tails of the distribution are not distinguished, that is, 10 percentile is treated as equivalent to 90 percentile.
+
+In this R implementation, percentile scores are between 0 and 1, but predicted values larger than 0.5 are subtracted from 1. Then, the minimum percentile score across all the environmental variables is computed (i.e. this is like Liebig’s law of the minimum, except that high values can also be limiting factors). The final value is subtracted from 1 and multiplied with 2 so that the results are between 0 and 1. The reason for this transformation is that the results become more like that of other distribution modeling methods and are thus easier to interpret. The value 1 will rarely be observed as it would require a location that has the median value of the training data for all the variables considered. The value 0 is very common as it is assigned to all cells with a value of an environmental variable that is outside the percentile distribution (the range of the training data) for at least one of the variables.
+
+The following lines of code will model the species distribution using Bioclim. In this example, we are only using species presence-only and two predictors: ocean depth and bottom temperature.
+
+```{r}
+		simData = simData[c("setid", "Depth", "Temperature", "P.A", "plon", "plat")]
+		names(simData)[1:4] = c("ID","z","t","Y")
+		dat.p = subset(simData,Y==1)
+		head(dat.p)
+
+		# just temp, depth
+		bc = bioclim(dat.p[,c('t','z')])
+		pI = predSpace[,c('tmean.climatology','z')]
+		names(pI)[1] = 't'
+		bcp = predict(bc,pI)
+		xyz_bioclim = cbind(baseLine,z=bcp)
+		corners = data.frame(lon=c(-67.54,-56.5),lat=c(41,47.2))
+		with(xyz_bioclim, hist(z, main = "bioclim output"))
+		bioclim.predict <- planarMap( xyz_bioclim, fn="simData.biocl.pred", loc="output",corners=corners,save=F)
+```
+
+#### GAMs
+
+R-package: “mgcv”: <https://cran.r-project.org/web/packages/mgcv/mgcv.pdf> Wood 2018
+
+Generalized additive model (GAM) approach allows for space to be explicitly incorporated into the model. GAMs allow the incorporation of smooth functions for covariates, allowing nonlinear relationships between the environmental data and the species data. "GAMs use non‐parametric, data‐defined smoothers to fit non‐linear functions, whereas GLMs fit parametric terms, usually some combination of linear, quadratic and/or cubic terms. Because of their greater flexibility, GAMs are more capable of modelling complex ecological response shapes than GLMs (Yee and Mitchell 1991)" Elith et al. 2006. The species distribution was modeled using a binomial generalized additive model (GAM; R-package “mgcv”; Wood 2006) with a logit link function. Smoothed (thin-plate-spline) covariates were ocean depth (z) and bottom temeprature (t). 
+
+```{r}
+# GAM: temp, depth, space
+  load("../data/Sim1.rdata")
+  simData <- lonlat2planar(simData,"utm20", input_names=c("X", "Y"))
+  simData = simData[c("setid", "Depth", "Temperature", "P.A", "plon", "plat")]
+	names(simData)[1:4] = c("ID","z","t","Y")
+
+	    Mf = formula( Y ~ s(t) +  s(z) + s(plon, plat)  )
+	    Md = simData[,c('plon','plat','t','z','Y')]
+
+	  Mo = gam( Mf, data=Md, family=binomial())
+		
+```
+GAM Output
+```{r}
+summary(Mo)
+```
+GAM Predictions 
+```{r}
+		pI = predSpace[,c('plon','plat','tmean.climatology','z')]
+		names(pI)[3] = 't'
+		bcp = predict(Mo,pI,type='response')
+		xyz_gam = cbind(baseLine,z=bcp)
+		corners = data.frame(lon=c(-67.54,-56.5),lat=c(41,47.2))
+		with(xyz_gam, hist(z, main = "GAM output"))
+		GAM.predict <- planarMap( xyz_gam, fn="simData.gambi.pred", loc="output",corners=corners,save=F)
+```
+
+#### MaxEnt (Maximum Entropy)
+
+R-package: “dismo”: <https://cran.r-project.org/web/packages/dismo/dismo.pdf>
+
+"The function uses environmental data for locations of known presence and for a large number of ’background’ locations. Environmental data can be extracted from raster files. The result is a model
+object that can be used to predict the suitability of other locations, for example, to predict the entire range of a species" Hijmans et al. 2017.
+
+This function uses the MaxEnt species distribution model software, which is a java program that you can download here <http://www.cs.princeton.edu/~schapire/maxent/>. Place the file ’maxent.jar’ in the ’java’ folder of this package. That is the folder returned by system.file("java", package="dismo"). You need MaxEnt version 3.3.3b or higher".
+
+The follwing line of code should return somehting like this: C:/Users/Documents/R/win-library/3.1/dismo/java
+
+```{r}
+system.file('java', package='dismo') 
+```
+Project environmental data in UTM coordinates reported in m, and then create a SpatialPointsDataFrame object (class for spatial attributes that have spatial point locations)
+
+```{r}
+load("../data/Env1.rdata")
+head(predSpace)
+predspace <- planar2lonlat(predSpace, "utm20")
+predspace.utm <- project(as.matrix(predspace[c("lon", "lat")]), "+proj=utm +zone=20 ellps=WGS84")
+head(predspace.utm)
+cords <- predspace.utm
+spdf <- SpatialPointsDataFrame(cords, data=predspace)
+```
+Grid the environmental data. predictors (ocean depth and temperature) are rasterized (if x represents points, each point is assigned to a grid cell) and stacked 
+
+```{r}
+xmn <- 100000
+ymn <- 4500000
+xmx <- 1000000
+ymx <- 5300000
+extent <- extent(xmn, xmx, ymn, ymx)
+ncols <- length(xmx:xmn)/grid
+nrows <- (length(ymx:ymn) - 1)/grid
+blankraster <- raster(nrows=nrows, ncols=ncols, xmn=xmn, xmx=xmx, ymn=ymn, ymx = ymx)
+blankraster[] <- 1: ncell(blankraster)
+depth <- rasterize(x=spdf, y=blankraster, field="z", fun=mean)
+temp <- rasterize(x=spdf, y=blankraster, field="tmean.climatology", fun=mean)
+predictorsr <- list(depth, temp)
+predictors<- raster::stack(predictorsr)
+names(predictors) <- c("z", "t")
+crs(predictors) <- "+proj=utm +zone=20 ellps=WGS84"
+```
+Project species data in UTM coordinates in m so it matches the projection of the environmental layers rasterized above  
+
+```{r}
+  load("../data/Sim1.rdata")
+  simData <- lonlat2planar(simData,"utm20", input_names=c("X", "Y"))
+  simdata.utm <- project(as.matrix(simData[c("X", "Y")]), "+proj=utm +zone=20 ellps=WGS84")
+  simdata <- cbind(simdata.utm, simData)
+  names(simdata)[1:2] = c("lonutm","latutm")
+  simdata = simdata[c("lonutm", "latutm", "P.A")]
+  pres <- simdata[simdata[, 3] == 1, 1:2]
+```
+MaxEnt is a presence-only model. Background points are sampled randomly from the cells that are not NA in the first predictor variable, unless background points (e.g. zeros) are specified. In our case we have zeros, thus we select those in the following step. Note that MaxEnt has been shown to be exactly mathematically equivalent to a GLM, more specifically, to a Poisson regression (also known as “log-linear modelling”) <https://methodsblog.com/2013/02/20/some-big-news-about-maxent/>
+
+```{r}
+head(simdata)
+abs <- simdata[simdata[, 3] == 0, 1:2]
+head(abs)
+```
+Run Maxent
+
+Following Phillips et al. (2006) and Merow et al. (2013), the MaxEnt runs were conducted using the following settings:
+  - selected random seed, 
+  - maximum number of background points = 10,000 (a random sample of point locations from the landscape to represent the environmental conditions in the study area),
+  - regularization multiplier = 1 (included to reduce over-fitting),
+  - number of replicates = 10 (to do multiple runs as a means to provide averages of the results from all models created), 
+  - no output grids,
+  - maximum iterations = 5000 (allows the model to have adequate opportunity for convergence),
+  convergence threshold = 0.00001.
+  - threads=2 (speeds up the processing)
+
+To assess uncertainty in model predictions, cross-validation replication was used, which incorporates all available sightings, making better use of smaller data-sets. Cumulative output type was selected to visualize MaxEnt results; this output does not rely on post-processing assumptions and it is useful when illustrating potential species range boundaries. Note that a sub-folder labelled "maxent"" will be created in "output" to display results.
+
+Specify the model
+```{r echo = TRUE, warning=FALSE, message=FALSE}
+#options(java.parameters = "-Xmx1g")
+model.maxent<-maxent(x=predictors, p=pres, a=abs, args=c("randomseed","threads=4", "replicatetype=crossvalidate", "jackknife=true", "responsecurves=true", "maximumiterations=5000", "replicates=10", "threads=2", "nooutputgrids", "betamultiplier=1"))
+```
+The following command will pop-out a window with all of MaxEnt results in html format 
+```{r }
+model.maxent
+```
+Prediction
+```{r echo = TRUE, warning=FALSE, message=FALSE}
+map.maxent <- predict(model.maxent, predictors, progress='text', args=c("outputformat=raw"))
+map.maxent.mean <- mean(map.maxent)
+```
+To allow for comparisons between results, we rescaled the raw output to range between 0 and 100. 
+```{r}
+source('../code/functions/scaledCumsum.r')
+suitability.maxent.cumulative <- scaledCumsum(map.maxent.mean)
+```
+Next step edits the raster of the maxent cumulative model to a xyz list to be able to plot it using the function planarMap (which requires UTM projection in km). The MaxEnt output is rescaled to 1 - 0 for consistency with previous approaches implemented in this project.
+
+```{r}
+xyz_maxent <- rasterToPoints(suitability.maxent.cumulative)
+xyz_maxent <- as.data.frame(xyz_maxent)
+plat.lon <- xyz_maxent[, -3]/1000 
+z <- xyz_maxent[, 3]/100 
+xyz_maxent = cbind(plat.lon,z)
+names(xyz_maxent)[1:2] = c("plon","plat")
+head(xyz_maxent)
+with(xyz_maxent, hist(z, main = "MaxEnt output"))
+maxent.predict <- planarMap(xyz_maxent, fn="simData.maxent.pred", loc="output",corners=corners,save=F)
+```
+
+#### Random Forest
+
+Random Forest is a flexible, machine learning algorithm commonly used in SDMs because of it’s simplicity and its use for both classification and regression tasks. Random forest builds multiple decision trees and merges them together to get more accurate and stable prediction. 
+
+"Several studies have shown that RF models often reach top predictive performance compared to other methods (e.g., Cutler et al. 2007). The RF method (Breiman 2001) is an ensemble learning technique based on a combination of a large set of decision trees. Each tree is trained by selecting a random set of variables and a random sample from the training dataset (i.e., the calibration data set). Three training parameters need to be defined in the RF algorithm: ntree, the number of bootstrap samples for the original data (the default is 500); mtry, the number of different predictors tested at each node (which in this case can be 19 at most); and nodesize, the minimal size of the terminal nodes of the trees, below which leaves are not further subdivided. RF was implemented using the random forest package in R with the default values of ntree=500, mtry=6, and nodesize=5. To cross-validate, training and testing data were created by random sampling (without replacement) using k-fold data partitioning from the dismo library in R" <http://publications.gc.ca/collections/collection_2018/mpo-dfo/fs70-5/Fs70-5-2018-002-eng.pdf>
+
+Load and set up data 
+```{r}
+load("../data/Sim1.rdata")
+simData <- lonlat2planar(simData,"utm20", input_names=c("X", "Y"))
+rdata = simData[c("Depth", "Temperature", "P.A")]
+names(rdata)[1:3] = c("z","t", "Y")
+rdata$Y = as.factor(rdata$Y)
+env = predspace[, 3:4]
+```
+Specify the model
+```{r}
+model <- Y ~ z + t
+rf1 <- randomForest(model, data=rdata, proximity=TRUE, type = 'prob', ntree=500, mtry=6, nodesize=5)
+rf1
+```
+Explore variable importance. In this case is ocean depth (z) and temperature (t).
+```{r}
+varImpPlot(rf1)
+```
+Prediction
+```{r}
+pr <- predict(predictors, rf1, type = 'prob', index = 2)
+```
+```{r}
+xyz_forest <- rasterToPoints(pr)
+xyz_forest <- as.data.frame(xyz_forest)
+rlat.lon <- xyz_forest[, -3]/1000 
+z <- xyz_forest[, 3]
+xyz_forest = cbind(rlat.lon,z)
+names(xyz_forest)[1:2] = c("plon","plat")
+with(xyz_forest, hist(z, main = "Random Forest output"))
+forest.predict <- planarMap(xyz_forest, fn="simData.rforest.pred", loc="output",corners=corners,save=F)
+```
+
+
+### 	Step 5. Model Comparison
+
+#### Transform SDM results to rasters, stack them, and run correlations
+
+Project SDM results in UTM coordinates reported in m, and then create a SpatialPointsDataFrame object (class for spatial attributes that have spatial point locations)
+
+```{r}
+a <- planar2lonlat(xyz_bioclim, "utm20")
+a.utm <- project(as.matrix(a[c("lon", "lat")]), "+proj=utm +zone=20 ellps=WGS84")
+cords_a <- a.utm
+a_spdf <- SpatialPointsDataFrame(cords_a, data=a)
+
+b <- planar2lonlat(xyz_gam, "utm20")
+b.utm <- project(as.matrix(b[c("lon", "lat")]), "+proj=utm +zone=20 ellps=WGS84")
+cords_b <- b.utm
+b_spdf <- SpatialPointsDataFrame(cords_b, data=b)
+
+c <- planar2lonlat(xyz_maxent, "utm20")
+c.utm <- project(as.matrix(c[c("lon", "lat")]), "+proj=utm +zone=20 ellps=WGS84")
+cords_c <- c.utm
+c_spdf <- SpatialPointsDataFrame(cords_c, data=c)
+
+d <- planar2lonlat(xyz_forest, "utm20")
+d.utm <- project(as.matrix(d[c("lon", "lat")]), "+proj=utm +zone=20 ellps=WGS84")
+cords_d <- d.utm
+d_spdf <- SpatialPointsDataFrame(cords_d, data=d)
+
+```
+Grid the SDM results: rasterize results (if x represents points, each point is assigned to a grid cell) and stack them
+
+```{r}
+xmn <- 100000
+ymn <- 4500000
+xmx <- 1000000
+ymx <- 5300000
+extent <- extent(xmn, xmx, ymn, ymx)
+ncols <- length(xmx:xmn)/grid
+nrows <- (length(ymx:ymn) - 1)/grid
+blankraster <- raster(nrows=nrows, ncols=ncols, xmn=xmn, xmx=xmx, ymn=ymn, ymx = ymx)
+blankraster[] <- 1: ncell(blankraster)
+
+raster_bioclim <- rasterize(x=a_spdf, y=blankraster, field="z", fun=mean)
+raster_gam <- rasterize(x=b_spdf, y=blankraster, field="z", fun=mean)
+raster_maxent <- rasterize(x=c_spdf, y=blankraster, field="z", fun=mean)
+raster_randforest <- rasterize(x=d_spdf, y=blankraster, field="z", fun=mean)
+
+SDM <- list(raster_bioclim, raster_gam, raster_maxent, raster_randforest)
+SDM <- raster::stack(SDM)
+names(SDM) <- c("Bioclim", "GAMs", "MaxEnt", "Random Forest")
+crs(SDM) <- "+proj=utm +zone=20 ellps=WGS84"
+SDM <- setMinMax(SDM)
+pairs(SDM, method= c("spearman"))
+#save file:
+#outfile = "output/gTiff/maxent.model.tif"
+#writeRaster(maxent.model, filename=outfile, overwrite=TRUE, format="GTiff", datatype="FLT4S")
+```
+#### Bioclim
+```{r}
+bioclim.predict
+```
+
+#### GAM
+```{r}
+GAM.predict
+```
+
+#### Random Forest
+```{r}
+forest.predict
+```
+
+#### MaxEnt
+```{r}
+maxent.predict 
+```
+
+
+
+
+
