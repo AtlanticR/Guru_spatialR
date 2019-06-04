@@ -20,7 +20,7 @@ Code used to run analysis is:
 ```
 Results from code above can be visualized here:
 ```R
-comming soon
+http://rpubs.com/MaritimesMSP/SDM_ScotianShelf
 ```
 ***
 
